@@ -11,60 +11,45 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from dataclasses import dataclass, field
+from functools import partial
+from io import BytesIO
 
-import io
-
-bti = lambda bytes_: int.from_bytes(bytes_, "little")
-itb = lambda int_, length=2: int_.to_bytes(length, "little")
-
-
-class riff_chunk:
-    cid = b""
-    size = 0
-    extra = b""
-    offset = 0
-    hsize = 8
-    cht = []
-    mod = False
-    data = b""
-
-    def __init__(
-        self, cid, size, hsize=8, extra=None, offset=0, cht=[], mod=False, data=None
-    ):
-        self.cid = cid
-        self.size = size
-        self.extra = extra
-        self.offset = offset
-        self.hsize = hsize
-        self.cht = cht
-        self.mod = mod
-        self.data = data
+bti = partial(int.from_bytes, byteorder="little")
+itb = partial(int.to_bytes, byteorder="little", length=2)
 
 
-class riff_path:
-    etp = None
-    ep = None
-    ebl = None
-    p = []
+@dataclass(kw_only=True)
+class RiffChunk:
+    cid: bytes = b""
+    size: int = 0
+    extra: bytes = b""
+    offset: int = 0
+    hsize: int = 8
+    cht: list = field(default_factory=list)
+    mod: bool = False
+    data: bytes = b""
 
-    def __init__(self, top, parr):
+
+class RiffPath:
+    def __init__(self, top: RiffChunk, parr: list[int]):
         self.etp = top
-        self.p = parr
+        self.p: list[int] = parr
         lf = len(parr)
         if lf > 1:
             self.ep = self.get_block(lf - 2)
         else:
             self.ep = top
-        self.ebl = self.get_block(lf - 1)
+        self.ebl: RiffChunk = self.get_block(lf - 1)
 
-    def get_block(self, pos):
+    def get_block(self, pos: int) -> RiffChunk:
         tp = self.p[: pos + 1]
         nbl = self.etp
         for i in tp:
             nbl = nbl.cht[i]
         return nbl
 
-    def update_path_sz(self, nsz):
+    def update_path_sz(self, nsz: int) -> None:
         diff = nsz - self.ebl.size
         barr = [self.get_block(bp) for bp in range(len(self.p))]
         barr.insert(0, self.etp)
@@ -84,23 +69,26 @@ class riff_path:
             i.mod = boo
 
 
+riff_chunk = RiffChunk
+riff_path = RiffPath
+
+
 class __w:
     p = None
 
 
-def is_riff(fs):
+def is_riff(fs: BytesIO) -> bool:
     fs.seek(0)
+
     h = fs.read(4)
-    if h != b"RIFF":
-        return False
-    return True
+    return h == b"RIFF"
 
 
-def get_chunk(fs, off=0):
+def get_chunk(fs: BytesIO, off=0) -> RiffChunk:
     fs.seek(off)
     h = fs.read(4)
     fss = bti(fs.read(4))
-    ack = riff_chunk(h, fss)
+    ack = RiffChunk(cid=h, size=fss)
     ack.offset = off + 8
     if h == b"RIFF" or h == b"LIST":
         ack.extra = fs.read(4)
@@ -109,17 +97,21 @@ def get_chunk(fs, off=0):
     return ack
 
 
-def get_riff(fs):
+def get_riff(fs: BytesIO):
     if not is_riff(fs):
         raise ValueError("Invalid RIFF file")
-        return None
     off = __w()
     off.p = 0
     return _get_level(fs, off)
 
 
-def _get_level(fs, off, size=None, parent=None):
-    if size == None and parent == None:
+def _get_level(
+    fs: BytesIO,
+    off: __w,
+    size: int | None = None,
+    parent: RiffChunk | None = None,
+):
+    if size is None and parent is None:
         p = get_chunk(fs)
         off.p += p.hsize
         _get_level(fs, off, p.size, p)  # Sets .cht
@@ -143,7 +135,6 @@ def _get_level(fs, off, size=None, parent=None):
 def get_metadata(fs, l):
     if l.cid != b"LIST" or l.extra != b"INFO":
         raise ValueError("Bad metadata block")
-        return
     m = dict()
     for i in l.cht:
         fs.seek(i.offset)
@@ -153,61 +144,74 @@ def get_metadata(fs, l):
 
 def path_to_metadata(pbl, new=False):
     bl = pbl.ebl
-    cc = []
+    cc: list[int] = []
     for c in range(len(bl.cht)):
         if bl.cht[c].cid == b"LIST" and bl.cht[c].extra == b"INFO":
             cc.append(c)
-    if cc == []:
-        if new:
-            nbl = riff_chunk(b"LIST", 4, hsize=12, extra=b"INFO", mod=True)
-            cc.append(len(pbl.ebl.cht))
-            pbl.ebl.cht.append(nbl)
-            pbl.add_header_size(_hsize=12)  # 8 in normal cases, here we include size
-            pbl.set_path_mod(True)
-        else:
+
+    if not cc:
+        if not new:
             raise ValueError("Metadata block not found")
-            return
-    return riff_path(bl, cc)
+
+        nbl = RiffChunk(
+            cid=b"LIST",
+            size=4,
+            hsize=12,
+            extra=b"INFO",
+            mod=True,
+        )
+        cc.append(len(pbl.ebl.cht))
+        pbl.ebl.cht.append(nbl)
+        pbl.add_header_size(_hsize=12)  # 8 in normal cases, here we include size
+        pbl.set_path_mod(True)
+
+    return RiffPath(bl, cc)
 
 
-def set_metadata(bpath, di, nullc=False):
+def set_metadata(bpath: RiffPath, di: dict, nullc=False) -> None:
     bl = bpath.ebl
     if bl.cid != b"LIST" or bl.extra != b"INFO":
         raise ValueError("Bad metadata block")
-        return
-    arr = []
+    arr: list[RiffChunk] = []
     acsz = 0
     for a in di:
         aa = a[:4]
         if len(di[a]) % 2 or nullc:
             di[a] += b"\x00"
-        arr.append(riff_chunk(aa, len(di[a]), mod=True, data=di[a]))
+        arr.append(
+            RiffChunk(
+                cid=aa,
+                size=len(di[a]),
+                mod=True,
+                data=di[a],
+            )
+        )
         acsz += 8 + len(di[a])
     acsz += 4
     bl.mod = True
     bl.cht = arr
-    bpath.update_path_sz(acsz)  # bl.size+=(diff of acsz) for everyone
+    bpath.update_path_sz(acsz)  # chunk.size+=(diff of acsz) for everyone
     bpath.set_path_mod(True)
 
 
-def save_riff(fs, bfs, bl):
-    fs.write(bl.cid)
-    fs.write(itb(bl.size, length=4))
-    if bl.mod:
-        if bl.cid == b"RIFF" or bl.cid == b"LIST":
-            if bl.data == None:
-                fs.write(bl.extra)
-                for i in bl.cht:
-                    save_riff(fs, bfs, i)
+def save_riff(dest_fs: BytesIO, buff: BytesIO, chunk: RiffChunk):
+    dest_fs.write(chunk.cid)
+    dest_fs.write(itb(chunk.size, length=4))
+    if chunk.mod:
+        if chunk.cid == b"RIFF" or chunk.cid == b"LIST":
+            if chunk.data is None:
+                dest_fs.write(chunk.extra)
+                for i in chunk.cht:
+                    save_riff(dest_fs, buff, i)
             else:
-                fs.write(bl.data)
+                dest_fs.write(chunk.data)
         else:
-            fs.write(bl.data)
+            dest_fs.write(chunk.data)
     else:
-        if bl.cid == b"RIFF" or bl.cid == b"LIST":
-            fs.write(bl.extra)
-            bfs.seek(bl.offset)
-            fs.write(bfs.read(bl.size - 4))
+        if chunk.cid == b"RIFF" or chunk.cid == b"LIST":
+            dest_fs.write(chunk.extra)
+            buff.seek(chunk.offset)
+            dest_fs.write(buff.read(chunk.size - 4))
         else:
-            bfs.seek(bl.offset)
-            fs.write(bfs.read(bl.size))
+            buff.seek(chunk.offset)
+            dest_fs.write(buff.read(chunk.size))
